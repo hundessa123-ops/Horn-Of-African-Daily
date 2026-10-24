@@ -11,9 +11,14 @@ import xml.etree.ElementTree as ET
 import feedparser
 
 # Add verified RSS feed URLs here in the next step.
+
 RSS_SOURCES = [
-    # Example: "https://example.com/rss.xml"
+    "https://news.google.com/rss/search?q=Ethiopia+politics&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=Ethiopia+diplomacy&hl=en-US&gl=US&ceid=US:en",
+    "https://www.aljazeera.com/xml/rss/all.xml",
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
 ]
+
 
 # Only add domains after confirming they are official government sites.
 OFFICIAL_DOMAINS = [
