@@ -1,16 +1,15 @@
 
-import hashlib
 import os
 import re
 import html
-from datetime import datetime, timezone
+import hashlib
+from difflib import SequenceMatcher
+from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 
 import feedparser
-
-# Add verified RSS feed URLs here in the next step.
 
 RSS_SOURCES = [
     "https://news.google.com/rss/search?q=Ethiopia+politics&hl=en-US&gl=US&ceid=US:en",
@@ -19,153 +18,210 @@ RSS_SOURCES = [
     "https://feeds.bbci.co.uk/news/world/rss.xml",
 ]
 
-
-# Only add domains after confirming they are official government sites.
-OFFICIAL_DOMAINS = [
-    # Example: "mfa.gov.et"
-]
-
 MAX_POSTS = 10
 MIN_MATCHES = 2
+MAX_AGE_HOURS = 48
 OUTPUT_PATH = "docs/feed.xml"
 
 
-def get_domain(url):
-    return (urlparse(url).hostname or "").lower().removeprefix("www.")
-
-
-def clean_text(value):
-    value = re.sub(r"<[^>]+>", " ", value or "")
+def clean(value):
+    value = re.sub(r"<[^>]*>", " ", value or "")
     return " ".join(html.unescape(value).split())
 
 
-def is_official(domain):
-    return any(
-        domain == trusted or domain.endswith("." + trusted)
-        for trusted in OFFICIAL_DOMAINS
-        if trusted
-    )
+def domain(url):
+    host = (urlparse(url).hostname or "").lower()
+    return host.removeprefix("www.")
+
+
+def normalize_title(title):
+    title = clean(title).lower()
+    return re.sub(r"[^a-z0-9 ]", " ", title).strip()
+
+
+def similar(a, b):
+    a = normalize_title(a)
+    b = normalize_title(b)
+
+    if not a or not b:
+        return False
+
+    ratio = SequenceMatcher(None, a, b).ratio()
+    wa, wb = set(a.split()), set(b.split())
+    overlap = len(wa & wb) / max(1, len(wa | wb))
+
+    return ratio >= 0.72 or overlap >= 0.60
 
 
 def main():
-    grouped = {}
+    articles = []
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=MAX_AGE_HOURS)
 
     for feed_url in RSS_SOURCES:
         try:
             feed = feedparser.parse(feed_url)
 
-            if feed.bozo and not feed.entries:
-                print("Could not read feed:", feed_url)
-                continue
+            print(
+                f"Feed: {feed_url} | "
+                f"Entries: {len(feed.entries)}"
+            )
 
             for entry in feed.entries:
                 link = entry.get("link", "").strip()
-                title = clean_text(entry.get("title", ""))
-                summary = clean_text(
+                title = clean(entry.get("title", ""))
+                summary = clean(
                     entry.get("summary", entry.get("description", ""))
                 )
 
                 if not link or not title:
                     continue
 
-                domain = get_domain(link)
-                if not domain or urlparse(link).scheme != "https":
+                if urlparse(link).scheme != "https":
                     continue
 
-                # Group exact URLs. Different URLs about the same event
-                # are not automatically considered independent verification.
-                key = hashlib.sha256(link.encode("utf-8")).hexdigest()
+                # Google News often provides the original publisher
+                # in the entry's source metadata.
+                source_info = entry.get("source", {})
+                source_url = source_info.get("href", "")
+                publisher = domain(source_url) if source_url else domain(link)
 
-                if key not in grouped:
-                    grouped[key] = {
-                        "title": title,
-                        "link": link,
-                        "summary": summary,
-                        "domains": set(),
-                        "published": entry.get("published", ""),
-                    }
+                if not publisher:
+                    continue
 
-                grouped[key]["domains"].add(domain)
+                # Do not count Google News itself as a news publisher.
+                if publisher in ("news.google.com", "google.com"):
+                    continue
 
-                if not grouped[key]["summary"] and summary:
-                    grouped[key]["summary"] = summary
+                published = entry.get("published_parsed")
+                if published:
+                    import calendar
+                    published_dt = datetime.fromtimestamp(
+                        calendar.timegm(published), tz=timezone.utc
+                    )
+                    if published_dt < cutoff or published_dt > now + timedelta(hours=2):
+                        continue
+                else:
+                    # Conservative policy: skip undated items.
+                    print("Skipped undated article:", title)
+                    continue
+
+                articles.append({
+                    "title": title,
+                    "summary": summary,
+                    "link": link,
+                    "publisher": publisher,
+                    "published": published_dt,
+                })
 
         except Exception as exc:
             print("Feed error:", feed_url, str(exc))
 
-    posts = []
+    # Cluster similar headlines. Similarity alone is imperfect and
+    # does not establish that the claims in an article are true.
+    clusters = []
 
-    for item in grouped.values():
-        # An official-domain match is a source classification, not proof
-        # that every claim in the story is independently verified.
-        if not (
-            is_official(get_domain(item["link"]))
-            or len(item["domains"]) >= MIN_MATCHES
-        ):
+    for article in sorted(
+        articles, key=lambda x: x["published"], reverse=True
+    ):
+        matched_cluster = None
+
+        for cluster in clusters:
+            if similar(article["title"], cluster[0]["title"]):
+                matched_cluster = cluster
+                break
+
+        if matched_cluster is None:
+            clusters.append([article])
+        else:
+            matched_cluster.append(article)
+
+    candidates = []
+
+    for cluster in clusters:
+        publishers = {a["publisher"] for a in cluster}
+
+        # Require independent publisher domains.
+        if len(publishers) < MIN_MATCHES:
             continue
 
-        text = item["summary"]
-        if not text:
-            print("Skipped item with no summary:", item["title"])
+        # Keep only one article per publisher in a cluster.
+        distinct = {}
+        for article in cluster:
+            distinct.setdefault(article["publisher"], article)
+
+        evidence = list(distinct.values())[:3]
+
+        # Prefer the clearest available RSS summary.
+        best = max(evidence, key=lambda a: len(a["summary"]))
+        if not best["summary"]:
+            print("Skipped without summary:", best["title"])
             continue
 
-        # Avoid implying that truncation is a complete summary.
-        words = text.split()
-        if len(words) > 75:
-            text = " ".join(words[:75]).rstrip(" ,;:") + "..."
+        headline = best["title"]
+        body_words = best["summary"].split()
 
-        # Headline + body + source URL must fit within 100 words.
-        headline = item["title"]
-        post_text = f"{headline}\n\n{text}\n\nSource: {item['link']}"
+        source_text = "Sources: " + " ".join(
+            article["link"] for article in evidence[:2]
+        )
+
+        # Enforce a maximum of 100 total words.
+        fixed_words = len(headline.split()) + len(source_text.split())
+        available = max(0, 100 - fixed_words - 1)
+        body = " ".join(body_words[:available])
+
+        if len(body_words) > available and available:
+            body = body.rstrip(" ,;:") + "..."
+
+        post_text = f"{headline}\n\n{body}\n\n{source_text}"
 
         if len(post_text.split()) > 100:
-            available = max(10, 95 - len(headline.split())
-                            - len(item["link"].split()))
-            text = " ".join(text.split()[:available]).rstrip(" ,;:") + "..."
-            post_text = f"{headline}\n\n{text}\n\nSource: {item['link']}"
+            continue
 
-        posts.append({
+        stable_id = hashlib.sha256(
+            normalize_title(headline).encode("utf-8")
+        ).hexdigest()
+
+        candidates.append({
             "title": headline,
             "text": post_text,
-            "link": item["link"],
-            "guid": hashlib.sha256(
-                item["link"].encode("utf-8")
-            ).hexdigest(),
+            "link": best["link"],
+            "guid": stable_id,
+            "published": best["published"],
         })
 
-    posts = posts[:MAX_POSTS]
+    candidates.sort(key=lambda x: x["published"], reverse=True)
+    candidates = candidates[:MAX_POSTS]
 
     root = ET.Element("rss", version="2.0")
     channel = ET.SubElement(root, "channel")
-    ET.SubElement(channel, "title").text = (
-        "Horn African Daily - News Feed"
-    )
+    ET.SubElement(channel, "title").text = "Horn African Daily"
     ET.SubElement(channel, "link").text = (
         "https://example.com/"
     )
     ET.SubElement(channel, "description").text = (
-        "News feed for Horn African Daily. Items require review."
+        "News candidates from multiple publishers; "
+        "automated matching is not a guarantee of accuracy."
     )
     ET.SubElement(channel, "language").text = "en"
 
-    now = format_datetime(datetime.now(timezone.utc))
-
-    for post in posts:
+    for post in candidates:
         item = ET.SubElement(channel, "item")
         ET.SubElement(item, "title").text = post["title"]
         ET.SubElement(item, "description").text = post["text"]
         ET.SubElement(item, "link").text = post["link"]
         ET.SubElement(item, "guid", isPermaLink="false").text = post["guid"]
-        ET.SubElement(item, "pubDate").text = now
+        ET.SubElement(item, "pubDate").text = format_datetime(
+            post["published"]
+        )
 
     os.makedirs("docs", exist_ok=True)
     ET.ElementTree(root).write(
         OUTPUT_PATH, encoding="utf-8", xml_declaration=True
     )
 
-    print(f"Created {OUTPUT_PATH}: {len(posts)} candidate posts")
-    if not posts:
-        print("No items passed the filters. Check RSS sources and logs.")
+    print(f"Candidate posts generated: {len(candidates)}")
+    print(f"RSS written to {OUTPUT_PATH}")
 
 
 if __name__ == "__main__":
